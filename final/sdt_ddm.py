@@ -163,53 +163,83 @@ def read_data(file_path, prepare_for='sdt', display=False):
     return data
 
 
-def apply_hierarchical_sdt_model(data):
-    """Apply a hierarchical Signal Detection Theory model using PyMC.
+def apply_hierarchical_sdt_model(data, draws=2000, tune=1000):
+    """Apply a hierarchical Signal Detection Theory model using PyMC and run sampling.
     
     This function implements a Bayesian hierarchical model for SDT analysis,
-    allowing for both group-level and individual-level parameter estimation.
+    quantifying the effects of Stimulus Type and Trial Difficulty on d' and criterion.
     
     Args:
         data: DataFrame containing SDT summary statistics
-        
-    Returns:
-        PyMC model object
-    """
-    # Get unique participants and conditions
-    P = len(data['pnum'].unique())
-    C = len(data['condition'].unique())
+        draws: Number of MCMC samples to draw
+        tune: Number of tuning steps
     
-    # Define the hierarchical model
+    Returns:
+        trace: PyMC trace object with posterior samples
+        model: PyMC model object
+    """
+    P = len(data['pnum'].unique())
+    
+    # Map condition back to Stimulus Type and Difficulty for modeling
+    data['stimulus_type'] = data['condition'] % 2  # 0=simple,1=complex
+    data['difficulty'] = data['condition'] // 2    # 0=easy,1=hard
+    
     with pm.Model() as sdt_model:
-        # Group-level parameters
-        mean_d_prime = pm.Normal('mean_d_prime', mu=0.0, sigma=1.0, shape=C)
-        stdev_d_prime = pm.HalfNormal('stdev_d_prime', sigma=1.0)
+        # Hyperpriors for d' intercept and effects
+        d_prime_intercept = pm.Normal('d_prime_intercept', mu=0, sigma=1)
+        d_prime_stimulus = pm.Normal('d_prime_stimulus', mu=0, sigma=1)
+        d_prime_difficulty = pm.Normal('d_prime_difficulty', mu=0, sigma=1)
+        d_prime_interaction = pm.Normal('d_prime_interaction', mu=0, sigma=1)
+        d_prime_sigma = pm.HalfNormal('d_prime_sigma', sigma=1)
         
-        mean_criterion = pm.Normal('mean_criterion', mu=0.0, sigma=1.0, shape=C)
-        stdev_criterion = pm.HalfNormal('stdev_criterion', sigma=1.0)
+        # Hyperpriors for criterion intercept and effects
+        criterion_intercept = pm.Normal('criterion_intercept', mu=0, sigma=1)
+        criterion_stimulus = pm.Normal('criterion_stimulus', mu=0, sigma=1)
+        criterion_difficulty = pm.Normal('criterion_difficulty', mu=0, sigma=1)
+        criterion_interaction = pm.Normal('criterion_interaction', mu=0, sigma=1)
+        criterion_sigma = pm.HalfNormal('criterion_sigma', sigma=1)
         
-        # Individual-level parameters
-        d_prime = pm.Normal('d_prime', mu=mean_d_prime, sigma=stdev_d_prime, shape=(P, C))
-        criterion = pm.Normal('criterion', mu=mean_criterion, sigma=stdev_criterion, shape=(P, C))
+        # Individual-level participant intercepts
+        d_prime_participant = pm.Normal('d_prime_participant', mu=0, sigma=d_prime_sigma, shape=P)
+        criterion_participant = pm.Normal('criterion_participant', mu=0, sigma=criterion_sigma, shape=P)
         
-        # Calculate hit and false alarm rates using SDT
-        hit_rate = pm.math.invlogit(d_prime - criterion)
-        false_alarm_rate = pm.math.invlogit(-criterion)
-                
+        # Compute d' and criterion for each data point
+        d_prime_mu = (d_prime_intercept 
+                      + d_prime_stimulus * data['stimulus_type']
+                      + d_prime_difficulty * data['difficulty']
+                      + d_prime_interaction * data['stimulus_type'] * data['difficulty']
+                      + d_prime_participant[data['pnum'] - 1])
+        
+        criterion_mu = (criterion_intercept
+                        + criterion_stimulus * data['stimulus_type']
+                        + criterion_difficulty * data['difficulty']
+                        + criterion_interaction * data['stimulus_type'] * data['difficulty']
+                        + criterion_participant[data['pnum'] - 1])
+        
+        # Hit and false alarm rates
+        hit_rate = pm.math.invlogit(d_prime_mu - criterion_mu)
+        false_alarm_rate = pm.math.invlogit(-criterion_mu)
+        
         # Likelihood for signal trials
-        # Note: pnum is 1-indexed in the data, but needs to be 0-indexed for the model, so we change the indexing here.  The results table will show participant numbers starting from 0, so we need to interpret the results accordingly.
         pm.Binomial('hit_obs', 
                    n=data['nSignal'], 
-                   p=hit_rate[data['pnum']-1, data['condition']], 
+                   p=hit_rate, 
                    observed=data['hits'])
         
         # Likelihood for noise trials
         pm.Binomial('false_alarm_obs', 
                    n=data['nNoise'], 
-                   p=false_alarm_rate[data['pnum']-1, data['condition']], 
+                   p=false_alarm_rate, 
                    observed=data['false_alarms'])
+        
+        trace = pm.sample(draws=draws, tune=tune, target_accept=0.9, return_inferencedata=True)
+
+        # Graph Posterior Distributions
+        az.plot_posterior(trace, hdi_prob=0.95)
+        plt.savefig("posterior_distributions.png", dpi=300)
     
-    return sdt_model
+    return trace, sdt_model
+
 
 def draw_delta_plots(data, pnum):
     """Draw delta plots comparing RT distributions between condition pairs.
@@ -312,8 +342,32 @@ def draw_delta_plots(data, pnum):
     # Save the figure
     plt.savefig(OUTPUT_DIR / f'delta_plots_{pnum}.png')
 
+def check_convergence(trace):
+    summary = az.summary(trace)
+    print("\nConvergence:")
+    print(summary[['r_hat']])
+    
+    max_rhat = summary['r_hat'].max()
+    if max_rhat > 1.1:
+        print("Does not Converge")
+    else:
+        print("\nConverges")
+
+
 # Main execution
 if __name__ == "__main__":
-    file_to_print = Path(__file__).parent / 'README.md'
-    with open(file_to_print, 'r') as file:
-        print(file.read())
+    file_path = Path('data.csv')  # Update path as needed
+    sdt_data = read_data(file_path, prepare_for='sdt', display=True)
+    
+    trace, model = apply_hierarchical_sdt_model(sdt_data, draws=2000, tune=1000)
+    check_convergence(trace)
+
+    delta_data = read_data(file_path, prepare_for='delta plots', display=True)
+
+    for pnum in delta_data['pnum'].unique():
+        print(f"Generating delta plots for participant {pnum}")
+        draw_delta_plots(delta_data, pnum)
+
+    print("As we can see from the d' distributions, sensitivity is much lower for hard trials, while the criterion stays relatively still. This means that trial difficulty strongly reduces participants ability to discriminate signal from noise.")
+    print("Stimulus complexity leads to a much smaller change in d' with approximately the same criterion, meaning that stimulus complexity has a modest to minimal effect on perception.")
+    print("The delta plots show us that more difficult trials lead to longer response times while complexity has a lesser effect, mirroring the previous two conclusions.")
